@@ -1,0 +1,238 @@
+diff --git a/src/main/java/de/mossgrabers/convertwithmoss/core/detector/AbstractDetector.java b/src/main/java/de/mossgrabers/convertwithmoss/core/detector/AbstractDetector.java
+index 4560468..c685253 100644
+--- a/src/main/java/de/mossgrabers/convertwithmoss/core/detector/AbstractDetector.java
++++ b/src/main/java/de/mossgrabers/convertwithmoss/core/detector/AbstractDetector.java
+@@ -38,6 +38,7 @@ import de.mossgrabers.convertwithmoss.core.AbstractCoreTask;
+ import de.mossgrabers.convertwithmoss.core.IMultisampleSource;
+ import de.mossgrabers.convertwithmoss.core.INotifier;
+ import de.mossgrabers.convertwithmoss.core.IPerformanceSource;
++import de.mossgrabers.convertwithmoss.core.MachineProgressReporter;
+ import de.mossgrabers.convertwithmoss.core.model.IFileBasedSampleData;
+ import de.mossgrabers.convertwithmoss.core.model.IGroup;
+ import de.mossgrabers.convertwithmoss.core.model.IMetadata;
+@@ -85,6 +86,15 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+ 
+     private final AtomicBoolean               isCancelled                         = new AtomicBoolean (false);
+ 
++    /** When {@link MachineProgressReporter} is active: total instrument files matched by configured endings (recursive). */
++    private int                               machineProgressTotal                = 0;
++    /** Completed instrument files so far (incremented after each preset/performance file finishes). */
++    private int                               machineProgressDone                 = 0;
++
++    /** Samples (zones) processed inside the current instrument file (RUS per-sample progress). */
++    private int                               machineProgressSamplesInFile        = 0;
++
++
+ 
+     /**
+      * Constructor.
+@@ -226,10 +236,35 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+                 if (this.waitForDelivery ())
+                     break;
+ 
+-                if (this.detectPerformances)
+-                    this.handlePerformanceFile (file);
+-                else
+-                    this.handlePresetFile (file);
++                if (MachineProgressReporter.isEnabled ())
++                {
++                    this.machineProgressSamplesInFile = 0;
++
++                    // Per-file pct is based on finished files only; before the current file completes
++                    // calcMachineProgressPercent() stays at 0 while we may run for minutes (samples I/O).
++                    // Emit at least one sub-range start so hosts show non-zero busy state.
++                    final int pct = this.calcMachineProgressPercentStartingCurrentFile ();
++                    MachineProgressReporter.report (pct, "convert", file.getName ());
++                }
++
++                try
++                {
++                    if (this.detectPerformances)
++                        this.handlePerformanceFile (file);
++                    else
++                        this.handlePresetFile (file);
++                }
++                finally
++                {
++                    if (MachineProgressReporter.isEnabled ())
++                    {
++                        this.machineProgressDone++;
++                        MachineProgressReporter.report (
++                            this.calcMachineProgressPercentAfterFinishingCurrentFile (),
++                            "convert",
++                            file.getName ());
++                    }
++                }
+             }
+     }
+ 
+@@ -306,7 +341,19 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+     {
+         try
+         {
++            this.machineProgressDone = 0;
++            this.machineProgressTotal = 0;
++
++            if (MachineProgressReporter.isEnabled ())
++            {
++                this.machineProgressTotal = this.countMatchingInstrumentFiles (this.sourceFolder);
++                MachineProgressReporter.report (0, "start", this.sourceFolder.getAbsolutePath ());
++            }
++
+             this.detect (this.sourceFolder);
++
++            if (MachineProgressReporter.isEnabled ())
++                MachineProgressReporter.report (100, "done", "");
+         }
+         catch (final RuntimeException ex)
+         {
+@@ -320,6 +367,101 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+     }
+ 
+ 
++    /**
++     * Recursive count of files matching {@link #fileEndings} (traverse dirs; skip {@code ._*} junk).
++     *
++     * @param folder Root folder to scan
++     * @return Number of matching instrument files
++     */
++    protected int countMatchingInstrumentFiles (final File folder)
++    {
++        int count = 0;
++
++        final File [] children = folder.listFiles ();
++        if (children == null)
++            return 0;
++
++        for (final File f: children)
++        {
++            if (this.isCancelled ())
++                break;
++
++            if (f.isDirectory ())
++            {
++                count += this.countMatchingInstrumentFiles (f);
++                continue;
++            }
++
++            if (f.getName ().startsWith ("._"))
++                continue;
++
++            final String lower = f.getName ().toLowerCase (Locale.US);
++            for (final String ending: this.fileEndings)
++                if (lower.endsWith (ending))
++                {
++                    count++;
++                    break;
++                }
++        }
++
++        return count;
++    }
++
++
++    private int calcMachineProgressPercent ()
++    {
++        if (this.machineProgressTotal <= 0)
++            return this.machineProgressDone > 0 ? 100 : 0;
++        return (int) Math.min (100L, this.machineProgressDone * 100L / this.machineProgressTotal);
++    }
++
++
++    /** Pct at start of file {@code machineProgressDone} (0-based index): interpolation between milestones so a single giant .nki is not stuck at 0 %. */
++    private int calcMachineProgressPercentStartingCurrentFile ()
++    {
++        if (this.machineProgressTotal <= 0)
++            return this.machineProgressDone > 0 ? 100 : 0;
++
++        final int k = Math.max (0, this.machineProgressDone);
++        final int total = Math.max (1, this.machineProgressTotal);
++
++        final int lo = (int) (k * 100L / (long) total);
++        final int hi = Math.min (
++            100,
++            (int) ((k + 1L) * 100L / (long) total));
++        final int delta = hi - lo;
++        if (delta > 1)
++            return Math.min (
++                hi - 1,
++                Math.max (1, lo + Math.max (1, delta / 2)));
++        return Math.min (99, Math.max (1, lo + 1));
++    }
++
++
++    /** Pct immediately after completing the current file (same as legacy {@link #calcMachineProgressPercent}). */
++    private int calcMachineProgressPercentAfterFinishingCurrentFile ()
++    {
++        return this.calcMachineProgressPercent ();
++    }
++
++
++    /** Within-file pct while samples are loaded (unknown total -> asymptotic toward fileHi-1). */
++    private int calcMachineProgressPercentWithinCurrentFile ()
++    {
++        if (this.machineProgressTotal <= 0)
++            return this.machineProgressDone > 0 ? 100 : 0;
++
++        final int fileLo = (int) (this.machineProgressDone * 100L / (long) this.machineProgressTotal);
++        final int fileHi = Math.min (100, (int) ((this.machineProgressDone + 1L) * 100L / (long) this.machineProgressTotal));
++        if (fileHi <= fileLo + 1)
++            return Math.min (99, fileLo + 1);
++
++        final double span = (double) (fileHi - 1 - fileLo);
++        final double t = 1.0 - Math.exp (-this.machineProgressSamplesInFile / 25.0);
++        return fileLo + (int) Math.round (span * t);
++    }
++
++
+     /**
+      * Check for task cancellation.
+      *
+@@ -523,9 +665,19 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+      * @return The matching sample metadata, support is WAV and AIFF
+      * @throws IOException Unsupported sample file type
+      */
+-    protected ISampleZone createSampleZone (final File sampleFile) throws IOException
+-    {
+-        return new DefaultSampleZone (FileUtils.getNameWithoutType (sampleFile), createSampleData (sampleFile, this.notifier));
++    protected ISampleZone createSampleZone (final File sampleFile) throws IOException
++    {
++        final ISampleZone zone = new DefaultSampleZone (FileUtils.getNameWithoutType (sampleFile),
++            createSampleData (sampleFile, this.notifier));
++
++        if (MachineProgressReporter.isEnabled ())
++        {
++            ++this.machineProgressSamplesInFile;
++            MachineProgressReporter.report (this.calcMachineProgressPercentWithinCurrentFile (),
++                "sample", sampleFile.getName ());
++        }
++
++        return zone;
+     }
+ 
+ 
+@@ -590,15 +742,18 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+             if (fileEnding.endsWith (".ncw"))
+                 return new NcwFileSampleData (sampleFile);
+ 
+-            IFileBasedSampleData sampleData = null;
+-            final AudioFileFormat audioFileFormat = AudioSystem.getAudioFileFormat (sampleFile);
+-            final AudioFileFormat.Type type = audioFileFormat.getType ();
+-            if (AudioFileFormat.Type.WAVE.equals (type))
++            // Java Sound often rejects valid PCM WAV (e.g. 24-bit); our WaveFile parser accepts them.
++            if (fileEnding.endsWith (".wav"))
+             {
+                 if (AudioFileUtils.checkSampleFile (sampleFile, notifier))
+-                    sampleData = new WavFileSampleData (sampleFile);
++                    return new WavFileSampleData (sampleFile);
++                throw new IOException (Functions.getMessage (IDS_ERR_SOURCE_FORMAT_NOT_SUPPORTED, sampleFile.getName ()));
+             }
+-            else if (AudioFileFormat.Type.AIFF.equals (type))
++
++            IFileBasedSampleData sampleData = null;
++            final AudioFileFormat audioFileFormat = AudioSystem.getAudioFileFormat (sampleFile);
++            final AudioFileFormat.Type type = audioFileFormat.getType ();
++            if (AudioFileFormat.Type.AIFF.equals (type))
+                 sampleData = new AiffFileSampleData (sampleFile);
+             else if (OGG_TYPE.equals (type))
+                 sampleData = new OggFileSampleData (sampleFile);
