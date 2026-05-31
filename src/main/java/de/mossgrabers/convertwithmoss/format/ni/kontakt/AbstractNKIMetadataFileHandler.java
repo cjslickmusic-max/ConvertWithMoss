@@ -772,15 +772,17 @@ public abstract class AbstractNKIMetadataFileHandler
 
         // Check the type of the source sample for compatibility and handle them
         // accordingly
+        if (sampleFile.getName ().toLowerCase (Locale.US).endsWith (".wav"))
+        {
+            if (AudioFileUtils.checkSampleFile (sampleFile, this.notifier))
+                return new WavFileSampleData (sampleFile);
+            return null;
+        }
+
         try
         {
             final AudioFileFormat.Type type = AudioSystem.getAudioFileFormat (sampleFile).getType ();
-            if (AudioFileFormat.Type.WAVE.equals (type))
-            {
-                if (AudioFileUtils.checkSampleFile (sampleFile, this.notifier))
-                    return new WavFileSampleData (sampleFile);
-            }
-            else if (AudioFileFormat.Type.AIFF.equals (type))
+            if (AudioFileFormat.Type.AIFF.equals (type))
                 return new AiffFileSampleData (sampleFile);
 
             this.notifier.logError ("IDS_ERR_SOURCE_FORMAT_NOT_SUPPORTED", type.toString ());

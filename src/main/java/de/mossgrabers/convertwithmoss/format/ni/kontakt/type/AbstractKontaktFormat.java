@@ -261,17 +261,28 @@ public abstract class AbstractKontaktFormat implements IKontaktFormat
             files.add (sampleFile);
         }
 
-        // Only search for missing files, if all of them are missing!
-        if (isMonolith || missingFiles != files.size ())
+        // Nothing to recover from -> skip the recursive search.
+        if (isMonolith || missingFiles == 0)
             return files;
 
+        // RUS-patched: upstream only ran the recovery search when ALL samples were missing
+        // and only walked 2 levels up. Real Kontakt libraries often have one sample group
+        // referenced by stale absolute path while neighbouring groups load fine -> recover
+        // each missing file independently. height=3 catches the common "<lib>/<inst>/Samples/"
+        // layout where the staged .nki lives one level above its sibling sample folder.
         final List<File> lookedupFiles = new ArrayList<> ();
         File previousFolder = null;
 
         for (final File sampleFile: files)
         {
-            // Find the sample file starting 2 folders up
-            final int height = 2;
+            if (sampleFile.exists ())
+            {
+                lookedupFiles.add (sampleFile);
+                previousFolder = sampleFile.getParentFile ();
+                continue;
+            }
+
+            final int height = 3;
             final File file = AbstractDetector.findSampleFile (this.notifier, sampleFile.getParentFile (), previousFolder, sampleFile.getName (), height);
             if (file != null && file.exists ())
             {

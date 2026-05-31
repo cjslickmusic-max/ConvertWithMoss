@@ -175,8 +175,26 @@ public class SfzCreator extends AbstractWavCreator<SfzCreatorUI>
         if (ampEnvParamLevel == ParameterLevel.INSTRUMENT)
             createVolumeEnvelope (sb, groups.get (0).getSampleZones ().get (0));
 
-        // Add all groups with all sample zones (regions)
+        // RUS-patched: detect "keyswitch preset" heuristic. Reasoning: Native
+        // Instruments Kontakt stores per-group KS routing inside KSP scripts
+        // which we cannot parse. But the classic articulation layout is N>=2
+        // groups, all covering the SAME key range, with DIFFERENT content
+        // (different samples, sample-start offsets, or tunings). When we see
+        // that we synthesise sw_lokey/sw_hikey/sw_label opcodes anchored just
+        // below the playable range so the destination plugin (RUS) imports it
+        // as TriggerMode::Keyswitch. The owner can then re-map KS notes by
+        // hand in the Mapping Editor if the anchor doesn't suit them.
         final Map<IGroup, Integer> roundRobinGroups = multisampleSource.getRoundRobinGroups ();
+        final int [] ksAnchorPerGroup = computeRusKeyswitchAnchors (groups, roundRobinGroups);
+        if (ksAnchorPerGroup != null)
+        {
+            // Emit a sw_default on the global so the first group is active on
+            // load - mirrors the typical Kontakt "default articulation".
+            addIntegerAttribute (sb, "sw_default", ksAnchorPerGroup[0], true);
+        }
+
+        // Add all groups with all sample zones (regions)
+        int rusGroupIndex = 0;
         for (final IGroup group: groups)
         {
             final List<ISampleZone> zones = group.getSampleZones ();
@@ -212,14 +230,99 @@ public class SfzCreator extends AbstractWavCreator<SfzCreatorUI>
             if (trigger != null && trigger != TriggerType.ATTACK)
                 addAttribute (sb, SfzOpcode.TRIGGER, trigger.name ().toLowerCase (Locale.ENGLISH), true);
 
+            // RUS-patched: emit synthetic sw_lokey/sw_hikey/sw_label for KS-
+            // looking presets. See computeRusKeyswitchAnchors for criteria.
+            if (ksAnchorPerGroup != null)
+            {
+                final int anchor = ksAnchorPerGroup[rusGroupIndex];
+                addIntegerAttribute (sb, "sw_lokey", anchor, true);
+                addIntegerAttribute (sb, "sw_hikey", anchor, true);
+                final String lab = group.getName ();
+                if (lab != null && !lab.isBlank ())
+                    addAttribute (sb, "sw_label", lab, true);
+            }
+
             if (ampEnvParamLevel == ParameterLevel.GROUP)
                 createVolumeEnvelope (sb, zones.get (0));
 
             for (final ISampleZone zone: zones)
                 this.createSample (safeSampleFolderName, sb, zone, isNotRoundRobinGroup, ampEnvParamLevel);
+
+            rusGroupIndex++;
         }
 
         return sb.toString ();
+    }
+
+
+    /**
+     * RUS-patched keyswitch heuristic.
+     *
+     * Returns null when the source does NOT look like a KS preset. Returns
+     * one anchor note per group (left-to-right) when it does. Criteria:
+     *
+     *   1. groups.size () >= 2
+     *   2. All groups must cover an IDENTICAL key range (min keyLow and
+     *      max keyHigh equal across groups).
+     *   3. The number of distinct group "signatures" must equal groups.size ()
+     *      (every group has different content). Signature = sample name +
+     *      start offset + zone count. If even two groups are identical this
+     *      is probably a layered / xfade preset, not KS.
+     *   4. None of the groups is round-robin (those handled separately).
+     *
+     * Anchor placement: just below the playable range, descending if the
+     * range starts low. If playable range starts at note R and there are G
+     * groups, anchor = max (0, R - G). Each group i gets anchor + i. When
+     * R - G < 0 we fall back to 0 (C-1, MIDI lowest note).
+     */
+    private static int [] computeRusKeyswitchAnchors (final List<IGroup> groups, final Map<IGroup, Integer> roundRobinGroups)
+    {
+        if (groups == null || groups.size () < 2)
+            return null;
+        if (!roundRobinGroups.isEmpty ())
+            return null;
+
+        int sharedLow = Integer.MIN_VALUE;
+        int sharedHigh = Integer.MIN_VALUE;
+        final HashSet<String> signatures = new HashSet<> ();
+
+        for (final IGroup g: groups)
+        {
+            final List<ISampleZone> zs = g.getSampleZones ();
+            if (zs == null || zs.isEmpty ())
+                return null;
+
+            int gLow = Integer.MAX_VALUE;
+            int gHigh = Integer.MIN_VALUE;
+            final StringBuilder sig = new StringBuilder ();
+            for (final ISampleZone z: zs)
+            {
+                gLow = Math.min (gLow, z.getKeyLow ());
+                gHigh = Math.max (gHigh, z.getKeyHigh ());
+                sig.append (z.getName ()).append ('|').append (z.getStart ()).append (';');
+            }
+            sig.append ("#").append (zs.size ());
+
+            if (sharedLow == Integer.MIN_VALUE)
+            {
+                sharedLow = gLow;
+                sharedHigh = gHigh;
+            }
+            else if (sharedLow != gLow || sharedHigh != gHigh)
+                return null;
+
+            signatures.add (sig.toString ());
+        }
+
+        if (signatures.size () != groups.size ())
+            return null;
+
+        final int g = groups.size ();
+        final int anchor0 = Math.max (0, sharedLow - g);
+        final int [] anchors = new int [g];
+        for (int i = 0; i < g; i++)
+            anchors[i] = Math.min (127, anchor0 + i);
+        return anchors;
     }
 
 

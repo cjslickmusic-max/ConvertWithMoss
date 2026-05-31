@@ -101,6 +101,7 @@ public class CLIBackend implements INotifier
             spec.addOption (OptionSpec.builder ("-l", "--library").paramLabel ("LIBRARY").type (String.class).description ("Name for the library. Set to create a library.").build ());
             spec.addOption (OptionSpec.builder ("-p").paramLabel ("KEY=VALUE").description ("Key-value pairs in the form -pkey1=value1,key2=value2,...").required (false).arity ("0..*").type (Map.class).auxiliaryTypes (String.class, String.class).defaultValue (null).build ());
             spec.addOption (OptionSpec.builder ("-r", "--rename").paramLabel ("RENAME").type (File.class).description ("Configuration file for automatic file renaming.").build ());
+            spec.addOption (OptionSpec.builder ("-P", "--machine-progress").description ("Emit machine-readable conversion progress lines on stderr (prefix RUS_CWM_PROGRESS).").build ());
 
             // Processing parameters
             spec.addOption (OptionSpec.builder ("-Ze", "--ProcessEnable").paramLabel ("PROCESS_ENABLE").type (Boolean.class).description ("Enables processing if set to true.").build ());
@@ -213,6 +214,8 @@ public class CLIBackend implements INotifier
         detectSettings.wantsMultipleFiles = detectSettings.libraryName != null;
         detectSettings.createFolderStructure = parseResult.matchedOptionValue ('f', null) == null;
         final boolean onlyAnalyse = parseResult.matchedOptionValue ('a', null) != null;
+
+        MachineProgressReporter.setCliRequested (parseResult.matchedOptionValue ('P', null) != null);
 
         this.backend.detect (detector, creator, detectSettings, detectPerformances, onlyAnalyse);
 
