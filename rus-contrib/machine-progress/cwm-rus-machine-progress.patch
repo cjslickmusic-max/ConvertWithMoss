@@ -1,0 +1,413 @@
+diff --git a/src/main/java/de/mossgrabers/convertwithmoss/core/CLIBackend.java b/src/main/java/de/mossgrabers/convertwithmoss/core/CLIBackend.java
+index 927b992..1ebcee1 100644
+--- a/src/main/java/de/mossgrabers/convertwithmoss/core/CLIBackend.java
++++ b/src/main/java/de/mossgrabers/convertwithmoss/core/CLIBackend.java
+@@ -101,6 +101,7 @@ public class CLIBackend implements INotifier
+             spec.addOption (OptionSpec.builder ("-l", "--library").paramLabel ("LIBRARY").type (String.class).description ("Name for the library. Set to create a library.").build ());
+             spec.addOption (OptionSpec.builder ("-p").paramLabel ("KEY=VALUE").description ("Key-value pairs in the form -pkey1=value1,key2=value2,...").required (false).arity ("0..*").type (Map.class).auxiliaryTypes (String.class, String.class).defaultValue (null).build ());
+             spec.addOption (OptionSpec.builder ("-r", "--rename").paramLabel ("RENAME").type (File.class).description ("Configuration file for automatic file renaming.").build ());
++            spec.addOption (OptionSpec.builder ("-P", "--machine-progress").description ("Emit machine-readable conversion progress lines on stderr (prefix RUS_CWM_PROGRESS).").build ());
+ 
+             // Processing parameters
+             spec.addOption (OptionSpec.builder ("-Ze", "--ProcessEnable").paramLabel ("PROCESS_ENABLE").type (Boolean.class).description ("Enables processing if set to true.").build ());
+@@ -214,6 +215,8 @@ public class CLIBackend implements INotifier
+         detectSettings.createFolderStructure = parseResult.matchedOptionValue ('f', null) == null;
+         final boolean onlyAnalyse = parseResult.matchedOptionValue ('a', null) != null;
+ 
++        MachineProgressReporter.setCliRequested (parseResult.matchedOptionValue ('P', null) != null);
++
+         this.backend.detect (detector, creator, detectSettings, detectPerformances, onlyAnalyse);
+ 
+         while (!this.hasFinished)
+diff --git a/src/main/java/de/mossgrabers/convertwithmoss/core/detector/AbstractDetector.java b/src/main/java/de/mossgrabers/convertwithmoss/core/detector/AbstractDetector.java
+index 4560468..facb5ec 100644
+--- a/src/main/java/de/mossgrabers/convertwithmoss/core/detector/AbstractDetector.java
++++ b/src/main/java/de/mossgrabers/convertwithmoss/core/detector/AbstractDetector.java
+@@ -38,6 +38,7 @@ import de.mossgrabers.convertwithmoss.core.AbstractCoreTask;
+ import de.mossgrabers.convertwithmoss.core.IMultisampleSource;
+ import de.mossgrabers.convertwithmoss.core.INotifier;
+ import de.mossgrabers.convertwithmoss.core.IPerformanceSource;
++import de.mossgrabers.convertwithmoss.core.MachineProgressReporter;
+ import de.mossgrabers.convertwithmoss.core.model.IFileBasedSampleData;
+ import de.mossgrabers.convertwithmoss.core.model.IGroup;
+ import de.mossgrabers.convertwithmoss.core.model.IMetadata;
+@@ -85,6 +86,11 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+ 
+     private final AtomicBoolean               isCancelled                         = new AtomicBoolean (false);
+ 
++    /** When {@link MachineProgressReporter} is active: total instrument files matched by configured endings (recursive). */
++    private int                               machineProgressTotal                = 0;
++    /** Completed instrument files so far (incremented after each preset/performance file finishes). */
++    private int                               machineProgressDone                 = 0;
++
+ 
+     /**
+      * Constructor.
+@@ -226,10 +232,33 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+                 if (this.waitForDelivery ())
+                     break;
+ 
+-                if (this.detectPerformances)
+-                    this.handlePerformanceFile (file);
+-                else
+-                    this.handlePresetFile (file);
++                if (MachineProgressReporter.isEnabled ())
++                {
++                    // Per-file pct is based on finished files only; before the current file completes
++                    // calcMachineProgressPercent() stays at 0 while we may run for minutes (samples I/O).
++                    // Emit at least one sub-range start so hosts show non-zero busy state.
++                    final int pct = this.calcMachineProgressPercentStartingCurrentFile ();
++                    MachineProgressReporter.report (pct, "convert", file.getName ());
++                }
++
++                try
++                {
++                    if (this.detectPerformances)
++                        this.handlePerformanceFile (file);
++                    else
++                        this.handlePresetFile (file);
++                }
++                finally
++                {
++                    if (MachineProgressReporter.isEnabled ())
++                    {
++                        this.machineProgressDone++;
++                        MachineProgressReporter.report (
++                            this.calcMachineProgressPercentAfterFinishingCurrentFile (),
++                            "convert",
++                            file.getName ());
++                    }
++                }
+             }
+     }
+ 
+@@ -306,7 +335,19 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+     {
+         try
+         {
++            this.machineProgressDone = 0;
++            this.machineProgressTotal = 0;
++
++            if (MachineProgressReporter.isEnabled ())
++            {
++                this.machineProgressTotal = this.countMatchingInstrumentFiles (this.sourceFolder);
++                MachineProgressReporter.report (0, "start", this.sourceFolder.getAbsolutePath ());
++            }
++
+             this.detect (this.sourceFolder);
++
++            if (MachineProgressReporter.isEnabled ())
++                MachineProgressReporter.report (100, "done", "");
+         }
+         catch (final RuntimeException ex)
+         {
+@@ -320,6 +361,84 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+     }
+ 
+ 
++    /**
++     * Recursive count of files matching {@link #fileEndings} (traverse dirs; skip {@code ._*} junk).
++     *
++     * @param folder Root folder to scan
++     * @return Number of matching instrument files
++     */
++    protected int countMatchingInstrumentFiles (final File folder)
++    {
++        int count = 0;
++
++        final File [] children = folder.listFiles ();
++        if (children == null)
++            return 0;
++
++        for (final File f: children)
++        {
++            if (this.isCancelled ())
++                break;
++
++            if (f.isDirectory ())
++            {
++                count += this.countMatchingInstrumentFiles (f);
++                continue;
++            }
++
++            if (f.getName ().startsWith ("._"))
++                continue;
++
++            final String lower = f.getName ().toLowerCase (Locale.US);
++            for (final String ending: this.fileEndings)
++                if (lower.endsWith (ending))
++                {
++                    count++;
++                    break;
++                }
++        }
++
++        return count;
++    }
++
++
++    private int calcMachineProgressPercent ()
++    {
++        if (this.machineProgressTotal <= 0)
++            return this.machineProgressDone > 0 ? 100 : 0;
++        return (int) Math.min (100L, this.machineProgressDone * 100L / this.machineProgressTotal);
++    }
++
++
++    /** Pct at start of file {@code machineProgressDone} (0-based index): interpolation between milestones so a single giant .nki is not stuck at 0 %. */
++    private int calcMachineProgressPercentStartingCurrentFile ()
++    {
++        if (this.machineProgressTotal <= 0)
++            return this.machineProgressDone > 0 ? 100 : 0;
++
++        final int k = Math.max (0, this.machineProgressDone);
++        final int total = Math.max (1, this.machineProgressTotal);
++
++        final int lo = (int) (k * 100L / (long) total);
++        final int hi = Math.min (
++            100,
++            (int) ((k + 1L) * 100L / (long) total));
++        final int delta = hi - lo;
++        if (delta > 1)
++            return Math.min (
++                hi - 1,
++                Math.max (1, lo + Math.max (1, delta / 2)));
++        return Math.min (99, Math.max (1, lo + 1));
++    }
++
++
++    /** Pct immediately after completing the current file (same as legacy {@link #calcMachineProgressPercent}). */
++    private int calcMachineProgressPercentAfterFinishingCurrentFile ()
++    {
++        return this.calcMachineProgressPercent ();
++    }
++
++
+     /**
+      * Check for task cancellation.
+      *
+@@ -590,15 +709,18 @@ public abstract class AbstractDetector<T extends ICoreTaskSettings> extends Abst
+             if (fileEnding.endsWith (".ncw"))
+                 return new NcwFileSampleData (sampleFile);
+ 
+-            IFileBasedSampleData sampleData = null;
+-            final AudioFileFormat audioFileFormat = AudioSystem.getAudioFileFormat (sampleFile);
+-            final AudioFileFormat.Type type = audioFileFormat.getType ();
+-            if (AudioFileFormat.Type.WAVE.equals (type))
++            // Java Sound often rejects valid PCM WAV (e.g. 24-bit); our WaveFile parser accepts them.
++            if (fileEnding.endsWith (".wav"))
+             {
+                 if (AudioFileUtils.checkSampleFile (sampleFile, notifier))
+-                    sampleData = new WavFileSampleData (sampleFile);
++                    return new WavFileSampleData (sampleFile);
++                throw new IOException (Functions.getMessage (IDS_ERR_SOURCE_FORMAT_NOT_SUPPORTED, sampleFile.getName ()));
+             }
+-            else if (AudioFileFormat.Type.AIFF.equals (type))
++
++            IFileBasedSampleData sampleData = null;
++            final AudioFileFormat audioFileFormat = AudioSystem.getAudioFileFormat (sampleFile);
++            final AudioFileFormat.Type type = audioFileFormat.getType ();
++            if (AudioFileFormat.Type.AIFF.equals (type))
+                 sampleData = new AiffFileSampleData (sampleFile);
+             else if (OGG_TYPE.equals (type))
+                 sampleData = new OggFileSampleData (sampleFile);
+diff --git a/src/main/java/de/mossgrabers/convertwithmoss/format/ni/kontakt/AbstractNKIMetadataFileHandler.java b/src/main/java/de/mossgrabers/convertwithmoss/format/ni/kontakt/AbstractNKIMetadataFileHandler.java
+index 71f3b64..46cf75f 100644
+--- a/src/main/java/de/mossgrabers/convertwithmoss/format/ni/kontakt/AbstractNKIMetadataFileHandler.java
++++ b/src/main/java/de/mossgrabers/convertwithmoss/format/ni/kontakt/AbstractNKIMetadataFileHandler.java
+@@ -772,15 +772,17 @@ public abstract class AbstractNKIMetadataFileHandler
+ 
+         // Check the type of the source sample for compatibility and handle them
+         // accordingly
++        if (sampleFile.getName ().toLowerCase (Locale.US).endsWith (".wav"))
++        {
++            if (AudioFileUtils.checkSampleFile (sampleFile, this.notifier))
++                return new WavFileSampleData (sampleFile);
++            return null;
++        }
++
+         try
+         {
+             final AudioFileFormat.Type type = AudioSystem.getAudioFileFormat (sampleFile).getType ();
+-            if (AudioFileFormat.Type.WAVE.equals (type))
+-            {
+-                if (AudioFileUtils.checkSampleFile (sampleFile, this.notifier))
+-                    return new WavFileSampleData (sampleFile);
+-            }
+-            else if (AudioFileFormat.Type.AIFF.equals (type))
++            if (AudioFileFormat.Type.AIFF.equals (type))
+                 return new AiffFileSampleData (sampleFile);
+ 
+             this.notifier.logError ("IDS_ERR_SOURCE_FORMAT_NOT_SUPPORTED", type.toString ());
+diff --git a/src/main/java/de/mossgrabers/convertwithmoss/format/ni/kontakt/type/AbstractKontaktFormat.java b/src/main/java/de/mossgrabers/convertwithmoss/format/ni/kontakt/type/AbstractKontaktFormat.java
+index 45d4e12..20df872 100644
+--- a/src/main/java/de/mossgrabers/convertwithmoss/format/ni/kontakt/type/AbstractKontaktFormat.java
++++ b/src/main/java/de/mossgrabers/convertwithmoss/format/ni/kontakt/type/AbstractKontaktFormat.java
+@@ -261,17 +261,28 @@ public abstract class AbstractKontaktFormat implements IKontaktFormat
+             files.add (sampleFile);
+         }
+ 
+-        // Only search for missing files, if all of them are missing!
+-        if (isMonolith || missingFiles != files.size ())
++        // Nothing to recover from -> skip the recursive search.
++        if (isMonolith || missingFiles == 0)
+             return files;
+ 
++        // RUS-patched: upstream only ran the recovery search when ALL samples were missing
++        // and only walked 2 levels up. Real Kontakt libraries often have one sample group
++        // referenced by stale absolute path while neighbouring groups load fine -> recover
++        // each missing file independently. height=3 catches the common "<lib>/<inst>/Samples/"
++        // layout where the staged .nki lives one level above its sibling sample folder.
+         final List<File> lookedupFiles = new ArrayList<> ();
+         File previousFolder = null;
+ 
+         for (final File sampleFile: files)
+         {
+-            // Find the sample file starting 2 folders up
+-            final int height = 2;
++            if (sampleFile.exists ())
++            {
++                lookedupFiles.add (sampleFile);
++                previousFolder = sampleFile.getParentFile ();
++                continue;
++            }
++
++            final int height = 3;
+             final File file = AbstractDetector.findSampleFile (this.notifier, sampleFile.getParentFile (), previousFolder, sampleFile.getName (), height);
+             if (file != null && file.exists ())
+             {
+diff --git a/src/main/java/de/mossgrabers/convertwithmoss/format/sfz/SfzCreator.java b/src/main/java/de/mossgrabers/convertwithmoss/format/sfz/SfzCreator.java
+index ae4116e..5edfa0c 100644
+--- a/src/main/java/de/mossgrabers/convertwithmoss/format/sfz/SfzCreator.java
++++ b/src/main/java/de/mossgrabers/convertwithmoss/format/sfz/SfzCreator.java
+@@ -175,8 +175,26 @@ public class SfzCreator extends AbstractWavCreator<SfzCreatorUI>
+         if (ampEnvParamLevel == ParameterLevel.INSTRUMENT)
+             createVolumeEnvelope (sb, groups.get (0).getSampleZones ().get (0));
+ 
+-        // Add all groups with all sample zones (regions)
++        // RUS-patched: detect "keyswitch preset" heuristic. Reasoning: Native
++        // Instruments Kontakt stores per-group KS routing inside KSP scripts
++        // which we cannot parse. But the classic articulation layout is N>=2
++        // groups, all covering the SAME key range, with DIFFERENT content
++        // (different samples, sample-start offsets, or tunings). When we see
++        // that we synthesise sw_lokey/sw_hikey/sw_label opcodes anchored just
++        // below the playable range so the destination plugin (RUS) imports it
++        // as TriggerMode::Keyswitch. The owner can then re-map KS notes by
++        // hand in the Mapping Editor if the anchor doesn't suit them.
+         final Map<IGroup, Integer> roundRobinGroups = multisampleSource.getRoundRobinGroups ();
++        final int [] ksAnchorPerGroup = computeRusKeyswitchAnchors (groups, roundRobinGroups);
++        if (ksAnchorPerGroup != null)
++        {
++            // Emit a sw_default on the global so the first group is active on
++            // load - mirrors the typical Kontakt "default articulation".
++            addIntegerAttribute (sb, "sw_default", ksAnchorPerGroup[0], true);
++        }
++
++        // Add all groups with all sample zones (regions)
++        int rusGroupIndex = 0;
+         for (final IGroup group: groups)
+         {
+             final List<ISampleZone> zones = group.getSampleZones ();
+@@ -212,17 +230,102 @@ public class SfzCreator extends AbstractWavCreator<SfzCreatorUI>
+             if (trigger != null && trigger != TriggerType.ATTACK)
+                 addAttribute (sb, SfzOpcode.TRIGGER, trigger.name ().toLowerCase (Locale.ENGLISH), true);
+ 
++            // RUS-patched: emit synthetic sw_lokey/sw_hikey/sw_label for KS-
++            // looking presets. See computeRusKeyswitchAnchors for criteria.
++            if (ksAnchorPerGroup != null)
++            {
++                final int anchor = ksAnchorPerGroup[rusGroupIndex];
++                addIntegerAttribute (sb, "sw_lokey", anchor, true);
++                addIntegerAttribute (sb, "sw_hikey", anchor, true);
++                final String lab = group.getName ();
++                if (lab != null && !lab.isBlank ())
++                    addAttribute (sb, "sw_label", lab, true);
++            }
++
+             if (ampEnvParamLevel == ParameterLevel.GROUP)
+                 createVolumeEnvelope (sb, zones.get (0));
+ 
+             for (final ISampleZone zone: zones)
+                 this.createSample (safeSampleFolderName, sb, zone, isNotRoundRobinGroup, ampEnvParamLevel);
++
++            rusGroupIndex++;
+         }
+ 
+         return sb.toString ();
+     }
+ 
+ 
++    /**
++     * RUS-patched keyswitch heuristic.
++     *
++     * Returns null when the source does NOT look like a KS preset. Returns
++     * one anchor note per group (left-to-right) when it does. Criteria:
++     *
++     *   1. groups.size () >= 2
++     *   2. All groups must cover an IDENTICAL key range (min keyLow and
++     *      max keyHigh equal across groups).
++     *   3. The number of distinct group "signatures" must equal groups.size ()
++     *      (every group has different content). Signature = sample name +
++     *      start offset + zone count. If even two groups are identical this
++     *      is probably a layered / xfade preset, not KS.
++     *   4. None of the groups is round-robin (those handled separately).
++     *
++     * Anchor placement: just below the playable range, descending if the
++     * range starts low. If playable range starts at note R and there are G
++     * groups, anchor = max (0, R - G). Each group i gets anchor + i. When
++     * R - G < 0 we fall back to 0 (C-1, MIDI lowest note).
++     */
++    private static int [] computeRusKeyswitchAnchors (final List<IGroup> groups, final Map<IGroup, Integer> roundRobinGroups)
++    {
++        if (groups == null || groups.size () < 2)
++            return null;
++        if (!roundRobinGroups.isEmpty ())
++            return null;
++
++        int sharedLow = Integer.MIN_VALUE;
++        int sharedHigh = Integer.MIN_VALUE;
++        final HashSet<String> signatures = new HashSet<> ();
++
++        for (final IGroup g: groups)
++        {
++            final List<ISampleZone> zs = g.getSampleZones ();
++            if (zs == null || zs.isEmpty ())
++                return null;
++
++            int gLow = Integer.MAX_VALUE;
++            int gHigh = Integer.MIN_VALUE;
++            final StringBuilder sig = new StringBuilder ();
++            for (final ISampleZone z: zs)
++            {
++                gLow = Math.min (gLow, z.getKeyLow ());
++                gHigh = Math.max (gHigh, z.getKeyHigh ());
++                sig.append (z.getName ()).append ('|').append (z.getStart ()).append (';');
++            }
++            sig.append ("#").append (zs.size ());
++
++            if (sharedLow == Integer.MIN_VALUE)
++            {
++                sharedLow = gLow;
++                sharedHigh = gHigh;
++            }
++            else if (sharedLow != gLow || sharedHigh != gHigh)
++                return null;
++
++            signatures.add (sig.toString ());
++        }
++
++        if (signatures.size () != groups.size ())
++            return null;
++
++        final int g = groups.size ();
++        final int anchor0 = Math.max (0, sharedLow - g);
++        final int [] anchors = new int [g];
++        for (int i = 0; i < g; i++)
++            anchors[i] = Math.min (127, anchor0 + i);
++        return anchors;
++    }
++
++
+     /**
+      * Creates the metadata for one sample.
+      *
