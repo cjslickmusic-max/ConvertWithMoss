@@ -1,0 +1,35 @@
+name: CWM Mac ARM64 package
+on:
+  workflow_dispatch:
+jobs:
+  package-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: cjslickmusic-max/ConvertWithMoss
+          ref: rus-patched-2026-05
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Maven package
+        run: mvn -DskipTests clean package
+      - name: jpackage app-image
+        run: |
+          VER=17.2.0
+          jpackage \
+            --input target/lib \
+            --main-jar convertwithmoss-${VER}.jar \
+            --main-class de.mossgrabers.convertwithmoss.ui.ConvertWithMossApp \
+            --name ConvertWithMoss-rus-arm64 \
+            --app-version ${VER} \
+            --type app-image \
+            --dest target/rus-app-image-arm64 \
+            --java-options "--enable-native-access=ALL-UNNAMED" \
+            --vendor "Razumov (LGPL fork)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cwm-mac-arm64-app
+          path: target/rus-app-image-arm64/ConvertWithMoss-rus-arm64.app
+          retention-days: 3
